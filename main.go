@@ -1,15 +1,3 @@
-// AURA Voice Assistant — Go Edition
-// ==================================
-// Single .exe, zero runtime, no pip, no MSVC, no wheel errors.
-//
-// Architecture:
-//   goroutine 1  — continuous audio capture (malgo / PortAudio, real OS thread)
-//   goroutine 2  — VAD engine feeding an utterance assembler
-//   goroutine 3  — Google Speech-to-Text over HTTPS (concurrent with capture)
-//   main         — wake/command state machine
-//
-// All goroutines communicate through channels — Go's native concurrency
-// primitive, faster and safer than Python queues/locks.
 
 package main
 
@@ -22,6 +10,8 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -68,6 +58,7 @@ const (
 var (
 	statusLabel   *widget.Label
 	transcriptLog *widget.Entry
+	chatInput     *widget.Entry
 	printMu       sync.Mutex
 )
 
@@ -76,7 +67,10 @@ func setStatus(msg string) {
 	printMu.Lock()
 	fmt.Println("STATUS:", msg)
 	if statusLabel != nil {
-		statusLabel.SetText(msg)
+		// Proper thread-safe UI update using fyne.Do
+		fyne.Do(func() {
+			statusLabel.SetText(msg)
+		})
 	}
 	printMu.Unlock()
 }
@@ -87,9 +81,163 @@ func appendLog(speaker, msg string) {
 	line := fmt.Sprintf("[%s] %s", strings.ToUpper(speaker), msg)
 	fmt.Println(line)
 	if transcriptLog != nil {
-		transcriptLog.SetText(transcriptLog.Text + line + "\n")
+		// Proper thread-safe UI update using fyne.Do
+		fyne.Do(func() {
+			transcriptLog.SetText(transcriptLog.Text + line + "\n")
+			transcriptLog.CursorRow = len(strings.Split(transcriptLog.Text, "\n")) - 1
+		})
 	}
 	printMu.Unlock()
+}
+
+// speak uses Windows SAPI5 (via PowerShell) to speak text offline.
+func speak(text string) {
+	if text == "" {
+		return
+	}
+	// Escape double quotes for PowerShell
+	escaped := strings.ReplaceAll(text, "\"", "`\"")
+	// Use SAPI5 (Microsoft Zira is usually the default female voice)
+	psCommand := fmt.Sprintf("Add-Type -AssemblyName System.Speech; $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer; $synth.SelectVoiceByHints([System.Speech.Synthesis.VoiceGender]::Female); $synth.Speak(\"%s\")", escaped)
+	
+	cmd := exec.Command("powershell", "-Command", psCommand)
+	_ = cmd.Run()
+}
+
+// handleCommand checks for specific keywords and executes system tasks.
+func handleCommand(text string) {
+	text = strings.ToLower(text)
+
+	// 1. Refresh Computer
+	if strings.Contains(text, "refresh") {
+		appendLog("AURA", "Refreshing your system...")
+		go speak("Refreshing your system now.")
+		// PowerShell trick to refresh desktop icons
+		exec.Command("powershell", "-Command", "$shell = New-Object -ComObject Shell.Application; $shell.Namespace(0).Self.InvokeVerb('Refresh')").Run()
+		return
+	}
+
+	// 2. Open Google / Smart Search
+	if strings.Contains(text, "search") || strings.Contains(text, "google") {
+		query := ""
+		if strings.Contains(text, "search for") {
+			parts := strings.SplitN(text, "search for", 2)
+			query = strings.TrimSpace(parts[1])
+		} else if strings.Contains(text, "search") {
+			parts := strings.SplitN(text, "search", 2)
+			query = strings.TrimSpace(parts[1])
+		}
+		
+		if query != "" {
+			appendLog("AURA", "Searching Google for: "+query)
+			go speak("Searching Google for " + query)
+			exec.Command("rundll32", "url.dll,FileProtocolHandler", "https://www.google.com/search?q="+query).Run()
+		} else {
+			appendLog("AURA", "Opening Google...")
+			go speak("Opening Google.")
+			exec.Command("rundll32", "url.dll,FileProtocolHandler", "https://www.google.com").Run()
+		}
+		return
+	}
+
+	// 3. Open Folder
+	if strings.Contains(text, "open folder") || strings.Contains(text, "show folder") {
+		target := "downloads"
+		if strings.Contains(text, "folder") {
+			parts := strings.SplitN(text, "folder", 2)
+			target = strings.TrimSpace(parts[1])
+		}
+		
+		home, _ := os.UserHomeDir()
+		path := home + "\\" + target
+		// Handle common aliases
+		if target == "desktop" { path = "C:\\Users\\akatre\\OneDrive - Nice Software Solutions\\Desktop" }
+		if target == "downloads" { path = home + "\\Downloads" }
+
+		appendLog("AURA", "Opening folder: "+target)
+		go speak("Opening " + target + " folder.")
+		exec.Command("explorer", path).Run()
+		return
+	}
+
+	// 4. Create Folder/Document
+	if strings.Contains(text, "create") || strings.Contains(text, "make") {
+		name := "New_Item"
+		desktop := "C:\\Users\\akatre\\OneDrive - Nice Software Solutions\\Desktop\\"
+
+		if strings.Contains(text, "folder") {
+			parts := strings.SplitN(text, "folder", 2)
+			name = strings.TrimSpace(parts[1])
+			name = strings.TrimPrefix(name, "called ")
+			os.MkdirAll(desktop+name, 0755)
+			appendLog("AURA", "Created folder: "+name)
+			go speak("Created folder " + name)
+		} else if strings.Contains(text, "document") || strings.Contains(text, "file") {
+			parts := strings.SplitN(text, "document", 2)
+			if len(parts) < 2 { parts = strings.SplitN(text, "file", 2) }
+			name = strings.TrimSpace(parts[1])
+			name = strings.TrimPrefix(name, "called ")
+			if !strings.Contains(name, ".") { name += ".txt" }
+			
+			os.WriteFile(desktop+name, []byte("Created by Aura Voice Assistant"), 0644)
+			appendLog("AURA", "Created file: "+name)
+			go speak("I created the document " + name)
+		}
+		return
+	}
+
+	// 5. Delete File
+	if strings.Contains(text, "delete") || strings.Contains(text, "remove") {
+		target := ""
+		parts := strings.SplitN(text, "delete", 2)
+		if len(parts) < 2 { parts = strings.SplitN(text, "remove", 2) }
+		target = strings.TrimSpace(parts[1])
+		target = strings.TrimPrefix(target, "file ")
+		
+		desktop := "C:\\Users\\akatre\\OneDrive - Nice Software Solutions\\Desktop\\"
+		err := os.Remove(desktop + target)
+		if err != nil {
+			appendLog("SYSTEM", "Could not delete: "+target)
+		} else {
+			appendLog("AURA", "Deleted file: "+target)
+			go speak("Deleted " + target)
+		}
+		return
+	}
+
+	// 6. Set Alarm/Timer
+	if strings.Contains(text, "alarm") || strings.Contains(text, "timer") {
+		// Simple parser for "alarm for 10 seconds"
+		wait := 10 * time.Second
+		if strings.Contains(text, "seconds") {
+			// Extract number
+			fmt.Sscanf(text, "set alarm for %d seconds", &wait)
+			wait = wait * time.Second
+		}
+		
+		appendLog("AURA", fmt.Sprintf("Setting alarm for %v", wait))
+		go speak(fmt.Sprintf("Setting an alarm for %v", wait))
+		go func() {
+			time.Sleep(wait)
+			appendLog("ALARM", "TIME IS UP!")
+			speak("Wake up! Your timer is finished.")
+		}()
+		return
+	}
+
+	// 7. System Shutdown/Restart
+	if strings.Contains(text, "shutdown") || strings.Contains(text, "turn off computer") {
+		appendLog("AURA", "Shutting down computer in 60 seconds...")
+		go speak("The computer will shut down in one minute. Save your work.")
+		exec.Command("shutdown", "/s", "/t", "60").Run()
+		return
+	}
+	if strings.Contains(text, "restart computer") {
+		appendLog("AURA", "Restarting computer...")
+		go speak("Restarting the computer now.")
+		exec.Command("shutdown", "/r", "/t", "0").Run()
+		return
+	}
 }
 
 // ─── PCM helpers ─────────────────────────────────────────────────────────────
@@ -519,6 +667,7 @@ func run(ac *AudioCapture, vad *VAD) {
 			appendLog("SYSTEM", "Could not understand — please try again")
 		default:
 			appendLog("YOU", cmdText)
+			handleCommand(cmdText)
 		}
 	}
 }
@@ -558,17 +707,30 @@ func main() {
 
 	vad := newVAD()
 
+	// ─── Chat Input Handler ──────────────────────────────────────────────
+	chatInput = widget.NewEntry()
+	chatInput.SetPlaceHolder("Type here and press Enter to make Aura speak...")
+	chatInput.OnSubmitted = func(text string) {
+		if strings.TrimSpace(text) == "" {
+			return
+		}
+		appendLog("YOU (Typed)", text)
+		chatInput.SetText("") // Clear input
+		handleCommand(text)   // Process command
+	}
+
 	// Start Aura's main loop in background
 	go run(ac, vad)
 
 	// Layout
 	content := container.NewBorder(
 		container.NewPadded(statusLabel),
-		nil, nil, nil,
+		container.NewPadded(chatInput), // Input at the bottom
+		nil, nil,
 		scroll,
 	)
 
 	w.SetContent(content)
-	w.Resize(fyne.NewSize(500, 400))
+	w.Resize(fyne.NewSize(600, 500))
 	w.ShowAndRun()
 }
